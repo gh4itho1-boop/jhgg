@@ -2532,7 +2532,7 @@ class Gateway {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class ChannelSession {
-    constructor(token, channelId, messages, delayMs, images, userId, configId, dbInstance, onSend, onAutoReply, selfUsername, selfId, sharedReplied) {
+    constructor(token, channelId, messages, delayMs, images, userId, configId, dbInstance, onSend, onAutoReply, selfUsername, selfId, sharedReplied, sharedGateway) {
         this.token = token; this.channelId = channelId; this.messages = messages;
         this.delayMs = delayMs; this.images = images || []; this.userId = userId;
         this.configId = configId; this.db = dbInstance; this.onSend = onSend;
@@ -2541,7 +2541,8 @@ class ChannelSession {
         this.myId = selfId;
         this.fp = genFP(); // Unique browser fingerprint
         this.rest = new RestClient(token, this.fp);
-        this.gateway = new Gateway(token, this.fp, (msg) => this._onGatewayMessage(msg));
+        // ONE shared gateway per farm — not one per channel
+        this.gateway = sharedGateway || null;
         this.stopped = false; this.msgIdx = 0;
         // SHARED across all sessions — prevents multiple replies to same DM
         this.replied = sharedReplied || new Set();
@@ -2550,15 +2551,7 @@ class ChannelSession {
 
     async start() {
         console.log(`[SESSION ${this.channelId}] Starting as ${this.username}`);
-
-        // Connect gateway (fire-and-forget, auto-reply only)
-        this.gateway.connect().then(() => {
-            console.log(`[SESSION ${this.channelId}] Gateway connected`);
-        }).catch(err => {
-            console.log(`[SESSION ${this.channelId}] Gateway failed: ${err.message}`);
-        });
-
-        // Start message loop
+        // Start message loop only — gateway is shared, already connecting
         this._loop();
     }
 
@@ -2760,8 +2753,13 @@ class ChannelSession {
 
     destroy() {
         this.stopped = true;
-        this.gateway.destroy();
-        console.log(`[SESSION ${this.channelId}] Destroyed`);
+        // Don't destroy shared gateway here — farm cleanup handles it
+        console.log(`[SESSION ${this.channelId}] Stopped`);
+    }
+    destroyWithGateway() {
+        this.stopped = true;
+        if (this.gateway) this.gateway.destroy();
+        console.log(`[SESSION ${this.channelId}] Destroyed with gateway`);
     }
 }
 
@@ -2774,9 +2772,9 @@ const browserFarms = new Map(); // userId_configId -> { sessions: [], stats: {} 
 async function startBrowserFarm(userId, token, channels, messages, delay, autoReply, autoReplyText, configId, images, dbInstance) {
     const farmKey = `${userId}_${configId}`;
 
-    // Destroy old farm
+    // Destroy old farm (gateway first, then sessions)
     const old = browserFarms.get(farmKey);
-    if (old) { for (const s of old.sessions) s.destroy(); browserFarms.delete(farmKey); }
+    if (old) { if (old.gateway) old.gateway.destroy(); for (const s of old.sessions) s.destroy(); browserFarms.delete(farmKey); }
 
     const chList = channels.map(c => String(c).trim()).filter(c => /^\d+$/.test(c));
     if (chList.length === 0) throw new Error('No valid channels');
@@ -2807,6 +2805,22 @@ async function startBrowserFarm(userId, token, channels, messages, delay, autoRe
     let replyCount = 0;
     // SHARED replied set — all sessions use the same one so only ONE replies per DM
     const sharedReplied = new Set();
+    // ONE shared Gateway for the entire farm — not 84 separate WebSockets
+    const sharedFP = genFP();
+    // Pick the first session to handle all DMs (since replied is shared, any works)
+    let dmHandlerSession = null;
+    const sharedGateway = new Gateway(token, sharedFP, (msg) => {
+        if (!msg.author || !dmHandlerSession) return;
+        // Route to the DM handler session
+        if (msg.guild_id) return; // Only DMs
+        dmHandlerSession._handleDM(msg).catch(err => console.log(`[SHARED GW] DM handler error: ${err.message}`));
+    });
+    // Connect the shared gateway (fire-and-forget, auto-reconnects on close)
+    sharedGateway.connect().then(() => {
+        console.log(`[FARM ${configId}] Shared Gateway connected`);
+    }).catch(err => {
+        console.log(`[FARM ${configId}] Shared Gateway failed: ${err.message}`);
+    });
 
     function onSend(chId, text) {
         sendCount++;
@@ -2826,8 +2840,10 @@ async function startBrowserFarm(userId, token, channels, messages, delay, autoRe
     log(`Starting farm | ${chList.length} channels | ${messages.length} msgs | delay ${delay}ms`);
 
     for (const chId of chList) {
-        const s = new ChannelSession(token, chId, messages, delay, images, userId, configId, dbInstance, onSend, onAutoReply, selfUsername, selfId, sharedReplied);
+        const s = new ChannelSession(token, chId, messages, delay, images, userId, configId, dbInstance, onSend, onAutoReply, selfUsername, selfId, sharedReplied, sharedGateway);
         sessions.push(s);
+        // First session handles all DMs (replied set is shared, so any session works)
+        if (!dmHandlerSession) dmHandlerSession = s;
         stats.sessions[chId] = '#' + chId.slice(-4);
 
         // Start with error handling
@@ -2858,7 +2874,7 @@ async function startBrowserFarm(userId, token, channels, messages, delay, autoRe
         }
     }, 30000); // Check every 30s
 
-    browserFarms.set(farmKey, { sessions, stats, log, watchdog: watchdogInterval });
+    browserFarms.set(farmKey, { sessions, stats, log, watchdog: watchdogInterval, gateway: sharedGateway });
     return { sessions, stats };
 }
 
@@ -2867,6 +2883,9 @@ function stopBrowserFarm(userId, configId) {
     const farm = browserFarms.get(farmKey);
     if (farm) {
         if (farm.watchdog) clearInterval(farm.watchdog);
+        // Destroy shared gateway FIRST (stops all event handling)
+        if (farm.gateway) farm.gateway.destroy();
+        // Then stop all sessions
         for (const s of farm.sessions) s.destroy();
         browserFarms.delete(farmKey);
         return true;
@@ -3078,7 +3097,7 @@ app.post('/api/admin/whitelist/remove', ensureOwner, (req, res) => { const { use
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => { if (req.isAuthenticated()) return res.redirect('/dashboard'); res.redirect('/login'); });
-app.get('/dashboard', (req, res) => { if (!req.isAuthenticated()) return res.redirect('/login'); res.type('html').sendFile(path.join(__dirname, 'public', 'overall.html')); });
+app.get('/dashboard', (req, res) => { if (!req.isAuthenticated()) return res.redirect('/login'); res.type('html').sendFile(path.join(__dirname, 'public', 'overall.js')); });
 
 app.use((err, req, res, next) => {
   console.error('[SERVER ERROR]', err);
