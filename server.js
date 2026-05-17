@@ -1488,12 +1488,13 @@ class SimpleDB {
     return expired.length;
   }
 
-  useKey(key, userId) { const normalized = key.toString().toUpperCase().trim(); this.data.usedKeys[normalized] = { user_id: userId, used_at: Date.now() }; this.save(); }
-  isKeyUsed(key) { const normalized = key.toString().toUpperCase().trim(); return !!this.data.usedKeys[normalized]; }
+  useKey(key, userId) { const normalized = key.toString().trim(); this.data.usedKeys[normalized] = { user_id: userId, used_at: Date.now() }; this.save(); }
+  isKeyUsed(key) { const normalized = key.toString().trim(); return !!this.data.usedKeys[normalized]; }
 
   addCustomKey(key) {
-    const normalized = key.toString().toUpperCase().trim();
-    if (!/^TOKOS(1[0-9][0-9]|200)$/i.test(normalized)) return null;
+    const normalized = key.toString().trim();
+    // Accept any 4-8 digit numeric code (e.g., 2818, 08321, 472910)
+    if (!/^\d{4,8}$/.test(normalized)) return null;
     if (!this.data.customKeys) this.data.customKeys = [];
     if (!this.data.customKeys.includes(normalized)) { this.data.customKeys.push(normalized); this.save(); }
     return normalized;
@@ -1570,7 +1571,15 @@ class SimpleDB {
   }
 
   generateKey(duration) {
-    const key = 'GEN-' + Math.random().toString(36).substring(2, 8).toUpperCase() + '-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+    // Generate random 5-6 digit numeric key (e.g., 2818, 08321, 472910)
+    const length = Math.random() < 0.5 ? 5 : 6;
+    const min = Math.pow(10, length - 1);
+    const max = Math.pow(10, length) - 1;
+    let key = String(Math.floor(Math.random() * (max - min + 1)) + min);
+    // Ensure uniqueness
+    while (this.data.generatedKeys[key]) {
+      key = String(Math.floor(Math.random() * (max - min + 1)) + min);
+    }
     const now = Date.now();
     let expiresAt = null;
     if (duration !== 'lifetime') { const hours = parseInt(duration); expiresAt = now + (hours * 60 * 60 * 1000); }
@@ -1904,20 +1913,29 @@ if (CLIENT_ID && CLIENT_SECRET) {
   }));
 }
 
-const BASE_REDEEM_KEYS = Array.from({length: 100}, (_, i) => `HBB${i + 1}`);
-const VALID_REDEEM_KEYS = new Set(BASE_REDEEM_KEYS);
+// Random numeric keys: 4-8 digit codes like "2818", "08321", "472910"
+function generateSecureKey() {
+  // 5-6 digit random number, padded with leading zeros
+  const length = Math.random() < 0.5 ? 5 : 6;
+  const min = Math.pow(10, length - 1);
+  const max = Math.pow(10, length) - 1;
+  return String(Math.floor(Math.random() * (max - min + 1)) + min);
+}
 
 function validateKeyStrict(key) {
   if (!key || typeof key !== 'string') return { valid: false, error: 'Invalid key', normalized: null };
-  let trimmed = key.trim().toUpperCase();
-  const baseMatch = trimmed.match(/^HBB([1-9]|[1-9][0-9]|100)$/);
-  if (baseMatch) {
-    const num = parseInt(baseMatch[1], 10);
-    if (num >= 1 && num <= 100) return { valid: true, error: null, normalized: `HBB${num}` };
+  let trimmed = key.trim();
+  // Accept 4-8 digit numeric keys (e.g., 2818, 08321, 472910)
+  if (/^\d{4,8}$/.test(trimmed)) {
+    const customKeys = db.data.customKeys || [];
+    if (customKeys.includes(trimmed)) return { valid: true, error: null, normalized: trimmed };
+    if (db.isKeyValid(trimmed)) return { valid: true, error: null, normalized: trimmed, isGenerated: true };
   }
+  // Legacy: check uppercase for custom keys that may have been stored uppercase
+  const upper = trimmed.toUpperCase();
   const customKeys = db.data.customKeys || [];
-  if (customKeys.includes(trimmed)) return { valid: true, error: null, normalized: trimmed };
-  if (db.isKeyValid(trimmed)) return { valid: true, error: null, normalized: trimmed, isGenerated: true };
+  if (customKeys.includes(upper)) return { valid: true, error: null, normalized: upper };
+  if (db.isKeyValid(upper)) return { valid: true, error: null, normalized: upper, isGenerated: true };
   return { valid: false, error: 'Invalid key', normalized: null };
 }
 
@@ -2273,10 +2291,8 @@ app.post('/api/redeem', ensureAuthAPI, (req, res) => {
       if (!success) return res.json({ success: false, error: 'Key expired or revoked' });
       return res.json({ success: true, message: 'Access granted via generated key!' });
     }
-    if (!VALID_REDEEM_KEYS.has(normalizedKey)) {
-      const customKeys = db.data.customKeys || [];
-      if (!customKeys.includes(normalizedKey)) return res.json({ success: false, error: 'Invalid key' });
-    }
+    const customKeys = db.data.customKeys || [];
+    if (!customKeys.includes(normalizedKey)) return res.json({ success: false, error: 'Invalid key' });
     if (db.isKeyUsed(normalizedKey)) return res.json({ success: false, error: 'Key already used' });
     const user = db.getUser(userId);
     if (user.auto_adv_purchased === 1) return res.json({ success: false, error: 'You already have access' });
